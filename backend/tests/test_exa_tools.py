@@ -193,6 +193,54 @@ class TestWebFetchTool:
 
         assert result == "Error: Connection timeout"
 
+    def test_fetch_reads_web_fetch_config(self, mock_exa_client):
+        """Test that web_fetch_tool reads 'web_fetch' config, not 'web_search'."""
+        with patch("deerflow.community.exa.tools.get_app_config") as mock_config:
+            tool_config = MagicMock()
+            tool_config.model_extra = {"api_key": "exa-fetch-key"}
+            mock_config.return_value.get_tool_config.return_value = tool_config
+
+            mock_result = MagicMock()
+            mock_result.title = "Page"
+            mock_result.text = "Content."
+            mock_response = MagicMock()
+            mock_response.results = [mock_result]
+            mock_exa_client.get_contents.return_value = mock_response
+
+            from deerflow.community.exa.tools import web_fetch_tool
+
+            web_fetch_tool.invoke({"url": "https://example.com"})
+
+            mock_config.return_value.get_tool_config.assert_any_call("web_fetch")
+
+    def test_fetch_uses_independent_api_key(self, mock_exa_client):
+        """Test mixed-provider config: web_fetch uses its own api_key, not web_search's."""
+        with patch("deerflow.community.exa.tools.get_app_config") as mock_config:
+            with patch("deerflow.community.exa.tools.Exa") as mock_exa_cls:
+                mock_exa_cls.return_value = mock_exa_client
+                fetch_config = MagicMock()
+                fetch_config.model_extra = {"api_key": "exa-fetch-key"}
+
+                def get_tool_config(name):
+                    if name == "web_fetch":
+                        return fetch_config
+                    return None
+
+                mock_config.return_value.get_tool_config.side_effect = get_tool_config
+
+                mock_result = MagicMock()
+                mock_result.title = "Page"
+                mock_result.text = "Content."
+                mock_response = MagicMock()
+                mock_response.results = [mock_result]
+                mock_exa_client.get_contents.return_value = mock_response
+
+                from deerflow.community.exa.tools import web_fetch_tool
+
+                web_fetch_tool.invoke({"url": "https://example.com"})
+
+                mock_exa_cls.assert_called_once_with(api_key="exa-fetch-key")
+
     def test_fetch_truncates_long_content(self, mock_app_config, mock_exa_client):
         """Test fetch truncates content to 4096 characters."""
         mock_result = MagicMock()

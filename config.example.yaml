@@ -255,6 +255,8 @@ tools:
   #   # api_key: $EXA_API_KEY
 
   # Web fetch tool (uses Exa)
+  # NOTE: Only one web_fetch provider can be active at a time.
+  # Comment out the Jina AI web_fetch entry below before enabling this one.
   # - name: web_fetch
   #   group: web
   #   use: deerflow.community.exa.tools:web_fetch_tool

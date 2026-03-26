@@ -6,8 +6,8 @@ from langchain.tools import tool
 from deerflow.config import get_app_config
 
 
-def _get_exa_client() -> Exa:
-    config = get_app_config().get_tool_config("web_search")
+def _get_exa_client(tool_name: str = "web_search") -> Exa:
+    config = get_app_config().get_tool_config(tool_name)
     api_key = None
     if config is not None and "api_key" in config.model_extra:
         api_key = config.model_extra.get("api_key")
@@ -65,7 +65,7 @@ def web_fetch_tool(url: str) -> str:
         url: The URL to fetch the contents of.
     """
     try:
-        client = _get_exa_client()
+        client = _get_exa_client("web_fetch")
         res = client.get_contents([url], text={"max_characters": 4096})
 
         if res.results:
