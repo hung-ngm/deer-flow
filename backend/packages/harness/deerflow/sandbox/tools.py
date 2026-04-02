@@ -1,5 +1,6 @@
 import posixpath
 import re
+import shlex
 from pathlib import Path
 
 from langchain.tools import ToolRuntime, tool
@@ -12,10 +13,13 @@ from deerflow.sandbox.exceptions import (
     SandboxNotFoundError,
     SandboxRuntimeError,
 )
+from deerflow.sandbox.file_operation_lock import get_file_operation_lock
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
+from deerflow.sandbox.security import LOCAL_HOST_BASH_DISABLED_MESSAGE, is_host_bash_allowed
 
-_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![:\w])/(?:[^\s\"'`;&|<>()]+)")
+_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![:\w])(?<!:/)/(?:[^\s\"'`;&|<>()]+)")
+_FILE_URL_PATTERN = re.compile(r"\bfile://\S+", re.IGNORECASE)
 _LOCAL_BASH_SYSTEM_PATH_PREFIXES = (
     "/bin/",
     "/usr/bin/",
@@ -100,7 +104,7 @@ def _resolve_skills_path(path: str) -> str:
     if path == skills_container:
         return skills_host
 
-    relative = path[len(skills_container):].lstrip("/")
+    relative = path[len(skills_container) :].lstrip("/")
     return _join_path_preserving_style(skills_host, relative)
 
 
@@ -210,6 +214,35 @@ def _resolve_acp_workspace_path(path: str, thread_id: str | None = None) -> str:
         raise PermissionError("Access denied: path traversal detected")
 
     return str(resolved_path)
+
+
+def _get_mcp_allowed_paths() -> list[str]:
+    """Get the list of allowed paths from MCP config for file system server."""
+    allowed_paths = []
+    try:
+        from deerflow.config.extensions_config import get_extensions_config
+
+        extensions_config = get_extensions_config()
+
+        for _, server in extensions_config.mcp_servers.items():
+            if not server.enabled:
+                continue
+
+            # Only check the filesystem server
+            args = server.args or []
+            # Check if args has server-filesystem package
+            has_filesystem = any("server-filesystem" in arg for arg in args)
+            if not has_filesystem:
+                continue
+            # Unpack the allowed file system paths in config
+            for arg in args:
+                if not arg.startswith("-") and arg.startswith("/"):
+                    allowed_paths.append(arg.rstrip("/") + "/")
+
+    except Exception:
+        pass
+
+    return allowed_paths
 
 
 def _path_variants(path: str) -> set[str]:
@@ -470,6 +503,10 @@ def _resolve_and_validate_user_data_path(path: str, thread_data: ThreadDataState
 def validate_local_bash_command_paths(command: str, thread_data: ThreadDataState | None) -> None:
     """Validate absolute paths in local-sandbox bash commands.
 
+    This validation is only a best-effort guard for the explicit
+    ``sandbox.allow_host_bash: true`` opt-in. It is not a secure sandbox
+    boundary and must not be treated as isolation from the host filesystem.
+
     In local mode, commands must use virtual paths under /mnt/user-data for
     user data access. Skills paths under /mnt/skills and ACP workspace paths
     under /mnt/acp-workspace are allowed (path-traversal checks only; write
@@ -480,9 +517,20 @@ def validate_local_bash_command_paths(command: str, thread_data: ThreadDataState
     if thread_data is None:
         raise SandboxRuntimeError("Thread data not available for local sandbox")
 
+    # Block file:// URLs which bypass the absolute-path regex but allow local file exfiltration
+    file_url_match = _FILE_URL_PATTERN.search(command)
+    if file_url_match:
+        raise PermissionError(f"Unsafe file:// URL in command: {file_url_match.group()}. Use paths under {VIRTUAL_PATH_PREFIX}")
+
     unsafe_paths: list[str] = []
+    allowed_paths = _get_mcp_allowed_paths()
 
     for absolute_path in _ABSOLUTE_PATH_PATTERN.findall(command):
+        # Check for MCP filesystem server allowed paths
+        if any(absolute_path.startswith(path) or absolute_path == path.rstrip("/") for path in allowed_paths):
+            _reject_path_traversal(absolute_path)
+            continue
+
         if absolute_path == VIRTUAL_PATH_PREFIX or absolute_path.startswith(f"{VIRTUAL_PATH_PREFIX}/"):
             _reject_path_traversal(absolute_path)
             continue
@@ -551,6 +599,22 @@ def replace_virtual_paths_in_command(command: str, thread_data: ThreadDataState 
         result = pattern.sub(replace_user_data_match, result)
 
     return result
+
+
+def _apply_cwd_prefix(command: str, thread_data: ThreadDataState | None) -> str:
+    """Prepend 'cd <workspace> &&' so relative paths are anchored to the thread workspace.
+
+    Args:
+        command: The bash command to execute.
+        thread_data: The thread data containing the workspace path.
+
+    Returns:
+        The command prefixed with 'cd <workspace> &&' if workspace_path is available,
+        otherwise the original command unchanged.
+    """
+    if thread_data and (workspace := thread_data.get("workspace_path")):
+        return f"cd {shlex.quote(workspace)} && {command}"
+    return command
 
 
 def get_thread_data(runtime: ToolRuntime[ContextT, ThreadState] | None) -> ThreadDataState | None:
@@ -644,6 +708,8 @@ def ensure_sandbox_initialized(runtime: ToolRuntime[ContextT, ThreadState] | Non
     # Lazy acquisition: get thread_id and acquire sandbox
     thread_id = runtime.context.get("thread_id") if runtime.context else None
     if thread_id is None:
+        thread_id = runtime.config.get("configurable", {}).get("thread_id") if runtime.config else None
+    if thread_id is None:
         raise SandboxRuntimeError("Thread ID not available in runtime context")
 
     provider = get_sandbox_provider()
@@ -698,6 +764,59 @@ def ensure_thread_directories_exist(runtime: ToolRuntime[ContextT, ThreadState] 
     runtime.state["thread_directories_created"] = True
 
 
+def _truncate_bash_output(output: str, max_chars: int) -> str:
+    """Middle-truncate bash output, preserving head and tail (50/50 split).
+
+    bash output may have errors at either end (stderr/stdout ordering is
+    non-deterministic), so both ends are preserved equally.
+
+    The returned string (including the truncation marker) is guaranteed to be
+    no longer than max_chars characters. Pass max_chars=0 to disable truncation
+    and return the full output unchanged.
+    """
+    if max_chars == 0:
+        return output
+    if len(output) <= max_chars:
+        return output
+    total_len = len(output)
+    # Compute the exact worst-case marker length: skipped chars is at most
+    # total_len, so this is a tight upper bound.
+    marker_max_len = len(f"\n... [middle truncated: {total_len} chars skipped] ...\n")
+    kept = max(0, max_chars - marker_max_len)
+    if kept == 0:
+        return output[:max_chars]
+    head_len = kept // 2
+    tail_len = kept - head_len
+    skipped = total_len - kept
+    marker = f"\n... [middle truncated: {skipped} chars skipped] ...\n"
+    return f"{output[:head_len]}{marker}{output[-tail_len:] if tail_len > 0 else ''}"
+
+
+def _truncate_read_file_output(output: str, max_chars: int) -> str:
+    """Head-truncate read_file output, preserving the beginning of the file.
+
+    Source code and documents are read top-to-bottom; the head contains the
+    most context (imports, class definitions, function signatures).
+
+    The returned string (including the truncation marker) is guaranteed to be
+    no longer than max_chars characters. Pass max_chars=0 to disable truncation
+    and return the full output unchanged.
+    """
+    if max_chars == 0:
+        return output
+    if len(output) <= max_chars:
+        return output
+    total = len(output)
+    # Compute the exact worst-case marker length: both numeric fields are at
+    # their maximum (total chars), so this is a tight upper bound.
+    marker_max_len = len(f"\n... [truncated: showing first {total} of {total} chars. Use start_line/end_line to read a specific range] ...")
+    kept = max(0, max_chars - marker_max_len)
+    if kept == 0:
+        return output[:max_chars]
+    marker = f"\n... [truncated: showing first {kept} of {total} chars. Use start_line/end_line to read a specific range] ..."
+    return f"{output[:kept]}{marker}"
+
+
 @tool("bash", parse_docstring=True)
 def bash_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, command: str) -> str:
     """Execute a bash command in a Linux environment.
@@ -713,14 +832,32 @@ def bash_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, com
     """
     try:
         sandbox = ensure_sandbox_initialized(runtime)
-        ensure_thread_directories_exist(runtime)
-        thread_data = get_thread_data(runtime)
         if is_local_sandbox(runtime):
+            if not is_host_bash_allowed():
+                return f"Error: {LOCAL_HOST_BASH_DISABLED_MESSAGE}"
+            ensure_thread_directories_exist(runtime)
+            thread_data = get_thread_data(runtime)
             validate_local_bash_command_paths(command, thread_data)
             command = replace_virtual_paths_in_command(command, thread_data)
+            command = _apply_cwd_prefix(command, thread_data)
             output = sandbox.execute_command(command)
-            return mask_local_paths_in_output(output, thread_data)
-        return sandbox.execute_command(command)
+            try:
+                from deerflow.config.app_config import get_app_config
+
+                sandbox_cfg = get_app_config().sandbox
+                max_chars = sandbox_cfg.bash_output_max_chars if sandbox_cfg else 20000
+            except Exception:
+                max_chars = 20000
+            return _truncate_bash_output(mask_local_paths_in_output(output, thread_data), max_chars)
+        ensure_thread_directories_exist(runtime)
+        try:
+            from deerflow.config.app_config import get_app_config
+
+            sandbox_cfg = get_app_config().sandbox
+            max_chars = sandbox_cfg.bash_output_max_chars if sandbox_cfg else 20000
+        except Exception:
+            max_chars = 20000
+        return _truncate_bash_output(sandbox.execute_command(command), max_chars)
     except SandboxError as e:
         return f"Error: {e}"
     except PermissionError as e:
@@ -798,7 +935,14 @@ def read_file_tool(
             return "(empty)"
         if start_line is not None and end_line is not None:
             content = "\n".join(content.splitlines()[start_line - 1 : end_line])
-        return content
+        try:
+            from deerflow.config.app_config import get_app_config
+
+            sandbox_cfg = get_app_config().sandbox
+            max_chars = sandbox_cfg.read_file_output_max_chars if sandbox_cfg else 50000
+        except Exception:
+            max_chars = 50000
+        return _truncate_read_file_output(content, max_chars)
     except SandboxError as e:
         return f"Error: {e}"
     except FileNotFoundError:
@@ -834,7 +978,8 @@ def write_file_tool(
             thread_data = get_thread_data(runtime)
             validate_local_tool_path(path, thread_data)
             path = _resolve_and_validate_user_data_path(path, thread_data)
-        sandbox.write_file(path, content, append)
+        with get_file_operation_lock(sandbox, path):
+            sandbox.write_file(path, content, append)
         return "OK"
     except SandboxError as e:
         return f"Error: {e}"
@@ -875,16 +1020,17 @@ def str_replace_tool(
             thread_data = get_thread_data(runtime)
             validate_local_tool_path(path, thread_data)
             path = _resolve_and_validate_user_data_path(path, thread_data)
-        content = sandbox.read_file(path)
-        if not content:
-            return "OK"
-        if old_str not in content:
-            return f"Error: String to replace not found in file: {requested_path}"
-        if replace_all:
-            content = content.replace(old_str, new_str)
-        else:
-            content = content.replace(old_str, new_str, 1)
-        sandbox.write_file(path, content)
+        with get_file_operation_lock(sandbox, path):
+            content = sandbox.read_file(path)
+            if not content:
+                return "OK"
+            if old_str not in content:
+                return f"Error: String to replace not found in file: {requested_path}"
+            if replace_all:
+                content = content.replace(old_str, new_str)
+            else:
+                content = content.replace(old_str, new_str, 1)
+            sandbox.write_file(path, content)
         return "OK"
     except SandboxError as e:
         return f"Error: {e}"
